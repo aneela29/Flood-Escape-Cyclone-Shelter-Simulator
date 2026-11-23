@@ -19,6 +19,15 @@
 //   * generated sound (no .wav files needed): rain, wind, thunder, boat engines,
 //     rescue sirens, shelter warning siren, flood water, birds / crickets.
 //     Sounds are positional (left / right, near / far).
+//   * v3: thunderstorm (frequent lightning + rolling thunder), heavier rain
+//     sound, boats keep distance from each other, crowd murmur in the shelter,
+//     LED board on the shelter roof with the number of sheltered people,
+//     emergency-alert siren + megaphone announcement from the rescue boats:
+//     "Apnara je jekhane achhen, nirapod sthane ashroy grohon korun.
+//      Pani bipod shima otikrom korechhe!"
+//     The voice comes from announcement.wav next to main.exe. If it is missing,
+//     Windows' speech engine creates it on first start. For a real Bangla voice
+//     record the sentence yourself and save it as announcement.wav.
 //
 //  Compile (MSYS2 MINGW64 terminal):
 //     g++ main.cpp -o main.exe -O2 -lfreeglut -lopengl32 -lglu32 -lwinmm
@@ -101,6 +110,7 @@ static float night = 0.0f;                       // 0 = day, 1 = night (smooth)
 static float rainAmt = 0.0f, rainTarget = 0.0f, windAmt = 0.12f, storm = 0.1f;
 static float flash = 0.0f, boltLife = 0.0f, nextBolt = 8.0f;
 static float boltP[16][3]; static int boltN = 0;
+static float boltB[2][8][3]; static bool boltSheet = false;
 static const float windX = 0.94f, windZ = 0.34f;  // wind direction (unit)
 
 // camera
@@ -1086,15 +1096,27 @@ static int recruitNear(Boat& b, int id, float radius, bool sendNow) {
     }
     return n;
 }
+// extra cost for a spot another boat is already going to / waiting at (keeps boats apart)
+static int crowdedPenalty(int id, float x, float z, float r) {
+    int pen = 0;
+    for (int o = 0; o < NBOAT; o++) {
+        if (o == id) continue;
+        const Boat& ob = boats[o];
+        if ((ob.state == B_GO || ob.state == B_WAIT || ob.state == B_RETURN || ob.state == B_UNLOAD) && len2(ob.tx - x, ob.tz - z) < r) pen += 30;
+        if (len2(ob.x - x, ob.z - z) < r * 0.8f) pen += 15;
+    }
+    return pen;
+}
 static void startReturn(Boat& b, int id) {
     computeDock();
     if (!dockOK) { b.state = B_PATROL; return; }
     int bi, bj, gi, gj; cellOf(b.x, b.z, bi, bj); runBFS(bi, bj); cellOf(dockX, dockZ, gi, gj);
     int best = -1, bd = 1 << 30;
-    for (int di = -4; di <= 4; di++) for (int dj = -4; dj <= 4; dj++) {
+    for (int di = -6; di <= 6; di++) for (int dj = -5; dj <= 5; dj++) {
         int i = gi + di, j = gj + dj;
         if (i < 0 || j < 0 || i >= GN || j >= GN || bfsD[i][j] < 0) continue;
-        int c = abs(di) + abs(dj) * 2;                 // prefer cells closer to the shore
+        float cx, cz; cellCenter(i, j, cx, cz);
+        int c = abs(di) + abs(dj) * 2 + crowdedPenalty(id, cx, cz, 7.0f);   // near the shore, but each boat its own berth
         if (c < bd) { bd = c; best = i * GN + j; }
     }
     if (best < 0) { b.state = B_PATROL; return; }
@@ -1147,6 +1169,9 @@ static void boatThink(Boat& b, int id) {
                     int ni = ci + di, nj = cj + dj;
                     if (ni < 0 || nj < 0 || ni >= GN || nj >= GN || bfsD[ni][nj] < 0) continue;
                     int cost = bfsD[ni][nj] * 2 + abs(di) + abs(dj);
+                    if (cost >= bestC) continue;
+                    float ccx, ccz; cellCenter(ni, nj, ccx, ccz);
+                    cost += crowdedPenalty(id, ccx, ccz, 10.0f);
                     if (cost < bestC) { bestC = cost; best = (int)k; bgi = ni; bgj = nj; }
                 }
             }
@@ -1260,6 +1285,21 @@ static void updateBoats(float dt) {
             }
         }
     }
+    // keep boats from overlapping: push apart and slow down the one driving into the other
+    const float SEP = 5.8f;
+    for (int i = 0; i < NBOAT; i++)
+        for (int j = i + 1; j < NBOAT; j++) {
+            Boat& a = boats[i]; Boat& c = boats[j];
+            float dx = c.x - a.x, dz = c.z - a.z, d = len2(dx, dz);
+            if (d >= SEP) continue;
+            if (d < 0.01f) { dx = 1; dz = 0; d = 1; }
+            float ux = dx / d, uz = dz / d, push = (SEP - d) * 0.5f * std::min(1.0f, dt * 5.0f);
+            float ax = a.x - ux * push, az = a.z - uz * push, cx = c.x + ux * push, cz = c.z + uz * push;
+            if (depthAt(ax, az) > 0.3f && fabsf(ax) < 97 && fabsf(az) < 97) { a.x = ax; a.z = az; }
+            if (depthAt(cx, cz) > 0.3f && fabsf(cx) < 97 && fabsf(cz) < 97) { c.x = cx; c.z = cz; }
+            if (sinf(a.head) * ux + cosf(a.head) * uz > 0.3f) a.spd *= 1.0f - std::min(1.0f, dt * 3.0f);
+            if (-(sinf(c.head) * ux + cosf(c.head) * uz) > 0.3f) c.spd *= 1.0f - std::min(1.0f, dt * 3.0f);
+        }
     for (size_t i = 0; i < wakes.size();) {
         Wake& w = wakes[i];
         w.age += dt; w.x += w.vx * dt; w.z += w.vz * dt; w.vx *= 0.98f; w.vz *= 0.98f; w.s += dt * 0.9f;
@@ -1514,24 +1554,38 @@ struct AudioTargets {
     float master, rain, wind, slosh, birds, crick;
     float engL[NBOAT], engR[NBOAT], engThr[NBOAT];
     float sirL[NBOAT + 1], sirR[NBOAT + 1];        // last one = shelter siren
+    float crowdL, crowdR; int crowdN;               // people talking inside the cyclone shelter
+    float voiceL, voiceR, duck;                     // megaphone announcement (+ siren ducking)
+    unsigned int voiceTrig;
 };
 static AudioTargets AT;
-struct ThunderV { bool on; float delay, gain, pan, t, lp1, lp2; };
-static ThunderV thunder[4];
-static void queueThunder(float delay, float gain, float pan) {
-    for (int i = 0; i < 4; i++)
+static const int NTHUNDER = 6;
+struct ThunderV { bool on, close; float delay, gain, pan, t, lp1, lp2, lp3, seed; };
+static ThunderV thunder[NTHUNDER];
+static void queueThunder(float delay, float gain, float pan, bool close) {
+    for (int i = 0; i < NTHUNDER; i++)
         if (!thunder[i].on) {
-            thunder[i].on = true; thunder[i].delay = delay; thunder[i].gain = gain; thunder[i].pan = pan;
-            thunder[i].t = 0; thunder[i].lp1 = thunder[i].lp2 = 0; return;
+            ThunderV& t = thunder[i];
+            t.on = true; t.close = close; t.delay = delay; t.gain = gain; t.pan = pan;
+            t.t = 0; t.lp1 = t.lp2 = t.lp3 = 0; t.seed = rr(0, 6.28f); return;
         }
 }
+// recorded / generated announcement (mono, SRATE)
+static std::vector<float> voiceSamples;
+static const int ECHO_N = 8192;
+static const float VOWELS[6][2] = { {730, 1090}, {530, 1840}, {300, 2250}, {570, 840}, {320, 900}, {660, 1700} };
 struct SynthState {
     unsigned int ns;
     float master, rain, wind, slosh, birds, crick;
-    float rf[2][3], wf[2][2], sf[3];
+    float rf[2][4], wf[2][2], sf[3];
+    float splEnv, splLp, splPan;
     float engL[NBOAT], engR[NBOAT], engThr[NBOAT], engPh[NBOAT], engLp[NBOAT], engNz[NBOAT], engDc[NBOAT];
     float sirL[NBOAT + 1], sirR[NBOAT + 1], sirPh[NBOAT + 1], sirT[NBOAT + 1], sirLp[NBOAT + 1];
-    float dPh[8], dF[8], dEnv[8], dPan[8]; int dNext;
+    float alPh1[NBOAT], alPh2[NBOAT], alGate[NBOAT], duck;
+    float crowdL, crowdR, cvF0[8], cvPh[8], cvAmp[8], cvTgt[8], cvT[8], cvC1[8], cvC2[8], cvA1[8], cvA2[8], cvB1[8], cvB2[8], cvPan[8], cvLp;
+    float voiceL, voiceR, vHp, vLp; int vPos; unsigned int vSeen;
+    float echo[ECHO_N]; int echoW;
+    float dPh[16], dF[16], dEnv[16], dPan[16]; int dNext;
     bool cOn[3]; float cT[3], cDur[3], cF0[3], cF1[3], cPh[3], cPan[3]; int cReps[3];
     float crT, crPh, crPh2, crGate;
     float tsec;
@@ -1550,24 +1604,34 @@ static void synthBlock(short* out, int frames) {
         float L = 0, R = 0;
         // --- rain: band-limited hiss + low rumble, two independent channels + droplets
         if (SY.rain > 0.0005f) {
+            // heavy rain = bright hiss + mid "roar" + deep rumble, surging with the wind gusts
+            float surge = 0.82f + 0.18f * sinf(SY.tsec * 0.41f) * sinf(SY.tsec * 0.173f + 1.1f);
             for (int c = 0; c < 2; c++) {
                 float w = snoise();
                 SY.rf[c][0] += 0.5f * (w - SY.rf[c][0]);
                 SY.rf[c][1] += 0.035f * (SY.rf[c][0] - SY.rf[c][1]);
                 SY.rf[c][2] += 0.012f * (w - SY.rf[c][2]);
-                float s = ((SY.rf[c][0] - SY.rf[c][1]) * 0.55f + SY.rf[c][2] * 2.2f) * SY.rain;
+                SY.rf[c][3] += 0.16f * (w - SY.rf[c][3]);
+                float roar = (SY.rf[c][3] - SY.rf[c][1]) * 0.9f;
+                float s = ((SY.rf[c][0] - SY.rf[c][1]) * 0.85f + roar + SY.rf[c][2] * 3.4f) * SY.rain * surge;
                 if (c == 0) L += s; else R += s;
             }
-            if (unoise() < SY.rain * 0.0035f) {
-                int d = SY.dNext; SY.dNext = (SY.dNext + 1) % 8;
-                SY.dPh[d] = 0; SY.dF[d] = (1500.0f + 3700.0f * unoise()) * inv; SY.dEnv[d] = (0.06f + 0.22f * unoise()) * SY.rain; SY.dPan[d] = unoise();
+            if (unoise() < SY.rain * 0.012f) {                       // dense droplets on roofs / water
+                int d = SY.dNext; SY.dNext = (SY.dNext + 1) % 16;
+                SY.dPh[d] = 0; SY.dF[d] = (1200.0f + 4200.0f * unoise()) * inv; SY.dEnv[d] = (0.04f + 0.16f * unoise()) * SY.rain; SY.dPan[d] = unoise();
             }
+            if (SY.splEnv < 0.01f && unoise() < SY.rain * 0.0009f) { SY.splEnv = (0.12f + 0.2f * unoise()) * SY.rain; SY.splPan = unoise(); }
         }
-        for (int d = 0; d < 8; d++)
+        if (SY.splEnv > 0.0005f) {                                   // splash bursts (water dripping off roofs)
+            SY.splLp += 0.35f * (snoise() - SY.splLp);
+            float s = SY.splLp * SY.splEnv; SY.splEnv *= 0.9988f;
+            L += s * (1 - SY.splPan); R += s * SY.splPan;
+        }
+        for (int d = 0; d < 16; d++)
             if (SY.dEnv[d] > 0.0005f) {
                 float s = sinf(TP * SY.dPh[d]) * SY.dEnv[d];
                 SY.dPh[d] += SY.dF[d]; if (SY.dPh[d] > 1) SY.dPh[d] -= 1;
-                SY.dF[d] *= 0.99985f; SY.dEnv[d] *= 0.9972f;
+                SY.dF[d] *= 0.99985f; SY.dEnv[d] *= 0.996f;
                 L += s * (1 - SY.dPan[d]); R += s * SY.dPan[d];
             }
         // --- wind: slowly modulated low noise with gusts
@@ -1607,32 +1671,99 @@ static void synthBlock(short* out, int frames) {
             L += o * SY.engL[b]; R += o * SY.engR[b];
         }
         // --- sirens: rescue boats (fast wail) and the shelter (slow wail)
+        SY.duck += (AT.duck - SY.duck) * 0.0008f;
         for (int s = 0; s <= NBOAT; s++) {
             SY.sirL[s] += (AT.sirL[s] - SY.sirL[s]) * k; SY.sirR[s] += (AT.sirR[s] - SY.sirR[s]) * k;
-            if (SY.sirL[s] + SY.sirR[s] < 0.0008f) { SY.sirT[s] = 0; continue; }
+            if (SY.sirL[s] + SY.sirR[s] < 0.0008f) { SY.sirT[s] = 0; if (s < NBOAT) SY.alGate[s] = 0; continue; }
             SY.sirT[s] += inv;
-            float per = (s == NBOAT) ? 7.0f : 3.0f;
-            float u = 0.5f - 0.5f * cosf(TP * SY.sirT[s] / per);
-            float f = (s == NBOAT) ? 380.0f + 520.0f * u : 640.0f + 560.0f * u;
-            SY.sirPh[s] += f * inv; if (SY.sirPh[s] >= 1) SY.sirPh[s] -= 1;
-            float ph = SY.sirPh[s];
-            float w = sinf(TP * ph) + 0.28f * sinf(3 * TP * ph) + 0.12f * sinf(5 * TP * ph);
-            SY.sirLp[s] += 0.35f * (w - SY.sirLp[s]);
-            L += SY.sirLp[s] * 0.17f * SY.sirL[s]; R += SY.sirLp[s] * 0.17f * SY.sirR[s];
+            float out;
+            if (s < NBOAT) {
+                // rescue boat cycle (10 s): emergency-alert attention tone (853 + 960 Hz, long-short-short), then wail
+                float cyc = fmodf(SY.sirT[s], 10.0f);
+                float gate = (cyc < 2.0f || (cyc > 2.4f && cyc < 3.4f) || (cyc > 3.8f && cyc < 4.8f)) ? 1.0f : 0.0f;
+                SY.alGate[s] += (gate - SY.alGate[s]) * 0.01f;
+                SY.alPh1[s] += 853.0f * inv; if (SY.alPh1[s] >= 1) SY.alPh1[s] -= 1;
+                SY.alPh2[s] += 960.0f * inv; if (SY.alPh2[s] >= 1) SY.alPh2[s] -= 1;
+                float alert = 0.55f * (sinf(TP * SY.alPh1[s]) + sinf(TP * SY.alPh2[s])) * SY.alGate[s];
+                float wailOn = clamp01((cyc - 5.0f) * 4.0f) * clamp01((10.0f - cyc) * 4.0f);
+                float u = 0.5f - 0.5f * cosf(TP * (cyc - 5.0f) / 2.5f);
+                SY.sirPh[s] += (640.0f + 600.0f * u) * inv; if (SY.sirPh[s] >= 1) SY.sirPh[s] -= 1;
+                float ph = SY.sirPh[s];
+                float w = (sinf(TP * ph) + 0.28f * sinf(3 * TP * ph) + 0.12f * sinf(5 * TP * ph)) * wailOn;
+                SY.sirLp[s] += 0.35f * (w - SY.sirLp[s]);
+                out = (SY.sirLp[s] + alert) * 0.19f * SY.duck;
+            } else {
+                float u = 0.5f - 0.5f * cosf(TP * SY.sirT[s] / 7.0f);
+                SY.sirPh[s] += (380.0f + 520.0f * u) * inv; if (SY.sirPh[s] >= 1) SY.sirPh[s] -= 1;
+                float ph = SY.sirPh[s];
+                float w = sinf(TP * ph) + 0.28f * sinf(3 * TP * ph) + 0.12f * sinf(5 * TP * ph);
+                SY.sirLp[s] += 0.35f * (w - SY.sirLp[s]);
+                out = SY.sirLp[s] * 0.17f * (0.4f + 0.6f * SY.duck);
+            }
+            L += out * SY.sirL[s]; R += out * SY.sirR[s];
+        }
+        // --- megaphone announcement from a rescue boat (band-limited, slightly distorted, outdoor echo)
+        if (AT.voiceTrig != SY.vSeen) { SY.vSeen = AT.voiceTrig; SY.vPos = 0; }
+        SY.voiceL += (AT.voiceL - SY.voiceL) * k; SY.voiceR += (AT.voiceR - SY.voiceR) * k;
+        {
+            float x = 0;
+            if (SY.vPos >= 0 && SY.vPos < (int)voiceSamples.size()) x = voiceSamples[SY.vPos++];
+            SY.vHp += 0.09f * (x - SY.vHp);
+            SY.vLp += 0.55f * ((x - SY.vHp) - SY.vLp);
+            float y = sclip(SY.vLp * 3.2f) * 0.55f;
+            float e = SY.echo[(SY.echoW + ECHO_N - 2900) % ECHO_N];
+            SY.echo[SY.echoW] = y + e * 0.28f; SY.echoW = (SY.echoW + 1) % ECHO_N;
+            float o = y + e * 0.35f;
+            L += o * SY.voiceL; R += o * SY.voiceR;
+        }
+        // --- crowd murmur inside the cyclone shelter (formant "babble" voices)
+        SY.crowdL += (AT.crowdL - SY.crowdL) * k; SY.crowdR += (AT.crowdR - SY.crowdR) * k;
+        if (SY.crowdL + SY.crowdR > 0.0008f) {
+            float cs = 0;
+            float cl = 0, cr = 0;
+            for (int v = 0; v < 8; v++) {
+                SY.cvT[v] -= inv;
+                if (SY.cvT[v] <= 0) {
+                    SY.cvT[v] = 0.09f + 0.22f * unoise();
+                    if (SY.cvF0[v] < 50) { SY.cvF0[v] = 95.0f + 170.0f * unoise(); SY.cvPan[v] = unoise(); }
+                    int vw = (int)(unoise() * 5.99f);
+                    float fs = 0.9f + 0.35f * (SY.cvF0[v] - 95.0f) / 170.0f;
+                    SY.cvC1[v] = 2.0f * 0.985f * cosf(TP * VOWELS[vw][0] * fs * inv);
+                    SY.cvC2[v] = 2.0f * 0.985f * cosf(TP * VOWELS[vw][1] * fs * inv);
+                    SY.cvTgt[v] = (v >= AT.crowdN || unoise() < 0.22f) ? 0.0f : 0.4f + 0.6f * unoise();
+                    SY.cvF0[v] *= 0.97f + 0.06f * unoise();
+                    SY.cvF0[v] = clampf(SY.cvF0[v], 85.0f, 290.0f);
+                }
+                SY.cvAmp[v] += (SY.cvTgt[v] - SY.cvAmp[v]) * 0.004f;
+                if (SY.cvAmp[v] < 0.001f) continue;
+                SY.cvPh[v] += SY.cvF0[v] * inv; if (SY.cvPh[v] >= 1) SY.cvPh[v] -= 1;
+                float ex = (SY.cvPh[v] - 0.5f) * 0.6f + snoise() * 0.2f;
+                float y1 = 0.015f * ex + SY.cvC1[v] * SY.cvA1[v] - 0.970225f * SY.cvA2[v]; SY.cvA2[v] = SY.cvA1[v]; SY.cvA1[v] = y1;
+                float y2 = 0.015f * ex + SY.cvC2[v] * SY.cvB1[v] - 0.970225f * SY.cvB2[v]; SY.cvB2[v] = SY.cvB1[v]; SY.cvB1[v] = y2;
+                float o = (y1 + 0.55f * y2) * SY.cvAmp[v] * 2.2f;
+                cl += o * (1 - SY.cvPan[v]); cr += o * SY.cvPan[v]; cs += o;
+            }
+            SY.cvLp += 0.6f * (cs - SY.cvLp);
+            L += cl * SY.crowdL; R += cr * SY.crowdR;
         }
         // --- thunder (arrives later than the flash - speed of sound)
-        for (int t = 0; t < 4; t++) {
+        for (int t = 0; t < NTHUNDER; t++) {
             ThunderV& th = thunder[t];
             if (!th.on) continue;
             if (th.delay > 0) { th.delay -= inv; continue; }
             th.t += inv;
-            float env = th.t < 0.06f ? th.t / 0.06f : expf(-(th.t - 0.06f) / 1.5f);
+            float env = th.close ? (th.t < 0.012f ? th.t / 0.012f : expf(-(th.t - 0.012f) / 2.8f))
+                                 : (th.t < 0.45f ? th.t / 0.45f : expf(-(th.t - 0.45f) / 2.4f));
             float w = snoise();
-            th.lp1 += 0.03f * (w - th.lp1); th.lp2 += 0.25f * (w - th.lp2);
-            float mod = 0.6f + 0.4f * sinf(th.t * 9.0f + sinf(th.t * 3.0f) * 3.0f);
-            float s = (th.lp1 * 5.0f + (th.t < 0.5f ? th.lp2 * 0.5f * (1 - th.t * 2) : 0.0f)) * env * mod * th.gain;
+            th.lp1 += 0.018f * (w - th.lp1); th.lp2 += 0.08f * (w - th.lp2); th.lp3 += 0.4f * (w - th.lp3);
+            // rolling: the rumble swells and fades as sound arrives from different parts of the bolt
+            float roll = 0.55f + 0.45f * sinf(th.t * 2.3f + th.seed + sinf(th.t * 0.9f) * 2.5f) * sinf(th.t * 1.1f + th.seed * 2.0f);
+            float rumble = th.lp1 * 7.5f + th.lp2 * (th.close ? 1.6f : 0.8f);
+            float s = rumble * env * roll;
+            if (th.close && th.t < 0.3f) { float c = 1.0f - th.t / 0.3f; s += (w - th.lp3) * 1.8f * c * c + th.lp3 * 0.9f * c; }   // sharp crack
+            s *= th.gain;
             L += s * sqrtf(0.5f * (1 - th.pan)); R += s * sqrtf(0.5f * (1 + th.pan));
-            if (th.t > 6.5f) th.on = false;
+            if (th.t > 10.0f) th.on = false;
         }
         // --- birds (calm day) and crickets (calm night)
         if (SY.birds > 0.003f) {
@@ -1672,6 +1803,91 @@ static void synthBlock(short* out, int frames) {
         L = sclip(L * SY.master); R = sclip(R * SY.master);
         out[2 * n] = (short)(L * 30000.0f); out[2 * n + 1] = (short)(R * 30000.0f);
     }
+}
+
+// ----------------------------------------------------------------------------
+//  Announcement voice: loads "announcement.wav" (any PCM wav: 8/16 bit, mono or
+//  stereo, any sample rate). If the file is missing, Windows' built-in speech
+//  engine creates it once (uses a Bangla voice if one is installed).
+//  Tip: for a real Bangla voice, record yourself (or use a Bangla TTS website)
+//  and save it as announcement.wav next to main.exe.
+// ----------------------------------------------------------------------------
+static bool loadWav(const char* fn) {
+    FILE* f = fopen(fn, "rb");
+    if (!f) return false;
+    std::vector<unsigned char> d;
+    unsigned char tmp[4096]; size_t n;
+    while ((n = fread(tmp, 1, sizeof tmp, f)) > 0) d.insert(d.end(), tmp, tmp + n);
+    fclose(f);
+    if (d.size() < 44 || memcmp(&d[0], "RIFF", 4) || memcmp(&d[8], "WAVE", 4)) return false;
+    int ch = 0, rate = 0, bits = 0; size_t dataOff = 0, dataLen = 0;
+    for (size_t p = 12; p + 8 <= d.size();) {
+        unsigned int len = d[p + 4] | (d[p + 5] << 8) | (d[p + 6] << 16) | ((unsigned int)d[p + 7] << 24);
+        if (!memcmp(&d[p], "fmt ", 4) && p + 24 <= d.size()) {
+            ch = d[p + 10] | (d[p + 11] << 8); rate = d[p + 12] | (d[p + 13] << 8) | (d[p + 14] << 16); bits = d[p + 22] | (d[p + 23] << 8);
+        } else if (!memcmp(&d[p], "data", 4)) { dataOff = p + 8; dataLen = std::min((size_t)len, d.size() - dataOff); break; }
+        p += 8 + len + (len & 1);
+    }
+    if (!dataOff || ch < 1 || rate < 4000 || (bits != 8 && bits != 16)) return false;
+    int bps = bits / 8, frames = (int)(dataLen / (bps * ch));
+    std::vector<float> mono(frames);
+    for (int i = 0; i < frames; i++) {
+        float acc = 0;
+        for (int c = 0; c < ch; c++) {
+            const unsigned char* q = &d[dataOff + (size_t)(i * ch + c) * bps];
+            acc += bits == 16 ? (short)(q[0] | (q[1] << 8)) / 32768.0f : (q[0] - 128) / 128.0f;
+        }
+        mono[i] = acc / ch;
+    }
+    int outN = (int)((double)frames * SRATE / rate);
+    voiceSamples.assign(outN, 0.0f);
+    float peak = 0.001f;
+    for (int i = 0; i < outN; i++) {
+        double src = (double)i * rate / SRATE; int a = (int)src; float t = (float)(src - a);
+        float v = mono[std::min(a, frames - 1)] * (1 - t) + mono[std::min(a + 1, frames - 1)] * t;
+        voiceSamples[i] = v; peak = std::max(peak, fabsf(v));
+    }
+    for (int i = 0; i < outN; i++) voiceSamples[i] *= 0.9f / peak;
+    return outN > 0;
+}
+#ifdef _WIN32
+static const char* ANN_PS =
+    "QQBkAGQALQBUAHkAcABlACAALQBBAHMAcwBlAG0AYgBsAHkATgBhAG0AZQAgAFMAeQBzAHQAZQBtAC4AUwBwAGUAZQBjAGgACgAk"
+    "AHMAIAA9ACAATgBlAHcALQBPAGIAagBlAGMAdAAgAFMAeQBzAHQAZQBtAC4AUwBwAGUAZQBjAGgALgBTAHkAbgB0AGgAZQBzAGkA"
+    "cwAuAFMAcABlAGUAYwBoAFMAeQBuAHQAaABlAHMAaQB6AGUAcgAKACQAdAAgAD0AIAAnAEEAcABuAGEAcgBhACAAagBlACAAagBl"
+    "AGsAaABhAG4AZQAgAGEAYwBoAGgAZQBuACwAIABuAGkAcgBhAHAAbwBkACAAcwB0AGgAYQBuAGUAeQAgAGEAcwBoAHIAbwB5ACAA"
+    "ZwByAG8AaABvAG4AIABrAG8AcgB1AG4ALgAgAFAAYQBuAGkALAAgAGIAaQBwAG8AZAAgAHMAaABpAG0AYQAgAG8AdABpAGsAcgBv"
+    "AG0AIABrAG8AcgBlAGMAaABoAGUAIQAnAAoAJAB2ACAAPQAgACQAcwAuAEcAZQB0AEkAbgBzAHQAYQBsAGwAZQBkAFYAbwBpAGMA"
+    "ZQBzACgAKQAgAHwAIABXAGgAZQByAGUALQBPAGIAagBlAGMAdAAgAHsAIAAkAF8ALgBWAG8AaQBjAGUASQBuAGYAbwAuAEMAdQBs"
+    "AHQAdQByAGUALgBOAGEAbQBlACAALQBsAGkAawBlACAAJwBiAG4AKgAnACAAfQAgAHwAIABTAGUAbABlAGMAdAAtAE8AYgBqAGUA"
+    "YwB0ACAALQBGAGkAcgBzAHQAIAAxAAoAaQBmACAAKAAkAHYAKQAgAHsAIAAkAHMALgBTAGUAbABlAGMAdABWAG8AaQBjAGUAKAAk"
+    "AHYALgBWAG8AaQBjAGUASQBuAGYAbwAuAE4AYQBtAGUAKQA7ACAAJAB0ACAAPQAgACcAhgmqCagJvgmwCb4JIACvCccJIACvCccJ"
+    "lgm+CagJxwkgAIYJmwnHCagJLAAgAKgJvwmwCb4JqgmmCSAAuAnNCaUJvgmoCccJIACGCbYJzQmwCa8JvAkgAJcJzQmwCbkJowkg"
+    "AJUJsAnBCagJZAkgAKoJvgmoCb8JIACsCb8JqgmmCbgJwAmuCb4JIACFCaQJvwmVCc0JsAmuCSAAlQmwCccJmwnHCSEAJwAgAH0A"
+    "CgAkAHMALgBSAGEAdABlACAAPQAgAC0AMQAKACQAcwAuAFYAbwBsAHUAbQBlACAAPQAgADEAMAAwAAoAJABzAC4AUwBlAHQATwB1"
+    "AHQAcAB1AHQAVABvAFcAYQB2AGUARgBpAGwAZQAoACgASgBvAGkAbgAtAFAAYQB0AGgAIAAoAEcAZQB0AC0ATABvAGMAYQB0AGkA"
+    "bwBuACkAIAAnAGEAbgBuAG8AdQBuAGMAZQBtAGUAbgB0AC4AdwBhAHYAJwApACkACgAkAHMALgBTAHAAZQBhAGsAKAAkAHQAKQAK"
+    "ACQAcwAuAEQAaQBzAHAAbwBzAGUAKAApAAoA";
+static void generateAnnouncement() {
+    std::vector<char> cmd;
+    const char* pre = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ";
+    cmd.insert(cmd.end(), pre, pre + strlen(pre));
+    cmd.insert(cmd.end(), ANN_PS, ANN_PS + strlen(ANN_PS));
+    cmd.push_back(0);
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof si); memset(&pi, 0, sizeof pi); si.cb = sizeof si;
+    if (CreateProcessA(NULL, &cmd[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 25000);
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    }
+}
+#endif
+static void initAnnouncement() {
+    if (loadWav("announcement.wav")) return;
+#ifdef _WIN32
+    generateAnnouncement();
+    loadWav("announcement.wav");
+#endif
 }
 
 #ifdef _WIN32
@@ -1718,6 +1934,10 @@ static void pumpAudio() {}
 static void closeAudio() {}
 #endif
 
+static int   annBoat = -1;
+static float annPlayT = 0, annCool = 3.0f;
+static const char* ANN_TEXT = "\"Apnara je jekhane achhen, nirapod sthane ashroy grohon korun. Pani bipod shima otikrom korechhe!\"";
+
 // distance attenuation + stereo panning of a sound source for the listener
 static void attn(float sx, float sy, float sz, float base, float& gl, float& gr) {
     float dx = sx - lisX, dy = sy - lisY, dz = sz - lisZ, d = sqrtf(dx * dx + dy * dy + dz * dz);
@@ -1726,9 +1946,9 @@ static void attn(float sx, float sy, float sz, float base, float& gl, float& gr)
     gl = a * sqrtf(0.5f * (1 - pn)); gr = a * sqrtf(0.5f * (1 + pn));
 }
 static void computeAudioTargets() {
-    AT.master = soundOn ? 0.9f : 0.0f;
+    AT.master = soundOn ? 0.8f : 0.0f;
     bool close = (viewMode == V_PERSON || viewMode == V_BOAT);
-    AT.rain = rainAmt * (close ? 0.85f : 0.55f);
+    AT.rain = powf(rainAmt, 0.8f) * (close ? 1.2f : 0.85f);
     AT.wind = windAmt * windAmt * (close ? 0.9f : 0.6f);
     float dep = depthAt(lisX, lisZ);
     if (viewMode == V_PERSON)    AT.slosh = dep > 0.05f ? clampf(0.35f + dep * 0.4f, 0, 1) : 0.0f;
@@ -1749,13 +1969,38 @@ static void computeAudioTargets() {
     }
     if (shelterSirenT > 0) attn(SHX, PAD + 18.0f, SHZ, 1.4f, AT.sirL[NBOAT], AT.sirR[NBOAT]);
     else AT.sirL[NBOAT] = AT.sirR[NBOAT] = 0;
+    // crowd inside the shelter: louder and denser when more people are sheltered
+    if (sheltered > 0) attn(SHX, PAD + 5.0f, SHZ, 1.5f * (0.35f + 0.65f * clamp01(sheltered / 150.0f)), AT.crowdL, AT.crowdR);
+    else AT.crowdL = AT.crowdR = 0;
+    AT.crowdN = std::min(8, 1 + sheltered / 12);
+    // megaphone announcement follows the boat that is speaking
+    if (annPlayT > 0 && annBoat >= 0) attn(boats[annBoat].x, waterLevel + 2.0f, boats[annBoat].z, 1.7f, AT.voiceL, AT.voiceR);
+    else AT.voiceL = AT.voiceR = 0;
+    AT.duck = annPlayT > 0 ? 0.25f : 1.0f;
+}
+// a rescue boat with its siren on repeats the announcement every few seconds
+static void updateAnnouncement(float dt) {
+    if (annPlayT > 0) annPlayT -= dt;
+    if (annCool > 0) annCool -= dt;
+    if (!running || annCool > 0) return;
+    int best = -1; float bd = 1e9f;
+    for (int i = 0; i < NBOAT; i++) {
+        const Boat& b = boats[i];
+        if (!b.siren) continue;
+        float d = len2(b.x - lisX, b.z - lisZ);
+        if (d < bd) { bd = d; best = i; }
+    }
+    if (best < 0) return;
+    float dur = voiceSamples.empty() ? 5.5f : voiceSamples.size() / (float)SRATE;
+    annBoat = best; annPlayT = dur; annCool = dur + 7.0f;
+    AT.voiceTrig++;
 }
 
 // ============================================================================
 //  Weather (real time): rain, wind, storm sky, lightning, rain particles
 // ============================================================================
 struct Drop { float x, y, z; };
-static const int NDROP = 2200;
+static const int NDROP = 3600;
 static Drop drops[NDROP];
 struct Ripple { float x, z, t; };
 static const int NRIP = 90;
@@ -1781,27 +2026,43 @@ static void weatherUpdate(float dt) {
     if (shelterSirenT > 0 && running) shelterSirenT -= dt;
 
     // lightning + thunder
-    if (rainAmt > 0.55f) {
+    // thunderstorm: frequent lightning (cloud-to-ground bolts with branches + sheet lightning inside the clouds)
+    if (rainAmt > 0.45f) {
         nextBolt -= dt;
         if (nextBolt <= 0) {
-            nextBolt = rr(6, 16);
-            float a = rr(0, 2 * PI), dist = rr(150, 380);
+            nextBolt = rr(2.5f, 7.0f) * (1.5f - rainAmt);
+            boltSheet = rnd() < 0.3f;
+            float a = rr(0, 2 * PI), dist = rnd() < 0.3f ? rr(45, 140) : rr(140, 420);
             float bx = lisX + cosf(a) * dist, bz = lisZ + sinf(a) * dist;
-            boltN = 14;
-            float px = bx, pz = bz;
-            for (int i = 0; i < boltN; i++) {
-                float t = i / (float)(boltN - 1);
-                boltP[i][0] = px; boltP[i][2] = pz; boltP[i][1] = mixf(190.0f, terrainH(bx, bz), t);
-                px += rr(-6, 6); pz += rr(-6, 6);
+            boltN = 0;
+            if (!boltSheet) {
+                boltN = 16;
+                float px = bx + rr(-30, 30), pz = bz + rr(-30, 30), gy = terrainH(bx, bz);
+                for (int i = 0; i < boltN; i++) {
+                    float t = i / (float)(boltN - 1);
+                    boltP[i][0] = mixf(px, bx, t * t) + rr(-4, 4); boltP[i][2] = mixf(pz, bz, t * t) + rr(-4, 4);
+                    boltP[i][1] = mixf(185.0f, gy, t);
+                }
+                boltP[boltN - 1][0] = bx; boltP[boltN - 1][2] = bz;
+                for (int b = 0; b < 2; b++) {                       // two side branches
+                    int st = 3 + (int)(rnd() * 6);
+                    float x = boltP[st][0], y = boltP[st][1], z = boltP[st][2], dx = rr(-1, 1), dz = rr(-1, 1);
+                    for (int i = 0; i < 8; i++) {
+                        boltB[b][i][0] = x; boltB[b][i][1] = y; boltB[b][i][2] = z;
+                        x += dx * 7 + rr(-3, 3); z += dz * 7 + rr(-3, 3); y -= rr(6, 11);
+                    }
+                }
             }
-            boltLife = 0.35f; flash = 1.0f;
+            boltLife = boltSheet ? 0.3f : 0.55f; flash = 1.0f;
             float dx = bx - lisX, dz = bz - lisZ;
-            float pan = clampf((dx * lisRX + dz * lisRZ) / dist, -1, 1) * 0.7f;
-            queueThunder(dist / 340.0f, clampf(160.0f / dist, 0.3f, 1.0f), pan);
+            float pan = clampf((dx * lisRX + dz * lisRZ) / dist, -1, 1) * 0.75f;
+            queueThunder(dist / 340.0f, clampf(230.0f / dist, 0.3f, 1.4f) * (boltSheet ? 0.6f : 1.0f), pan, dist < 150.0f && !boltSheet);
         }
     }
-    if (boltLife > 0) { boltLife -= dt; flash = (fmodf(boltLife * 23.0f, 1.0f) < 0.6f) ? 1.0f : 0.35f; }
-    else flash *= expf(-dt * 9.0f);
+    if (boltLife > 0) {
+        boltLife -= dt;
+        flash = (boltSheet ? 0.55f : 1.0f) * ((fmodf(boltLife * 17.0f, 1.0f) < 0.55f) ? 1.0f : 0.25f);
+    } else flash *= expf(-dt * 9.0f);
 
     // rain particles
     int active = (int)(NDROP * rainAmt);
@@ -1963,7 +2224,74 @@ static void drawBarrier(const Road& R, float t) {
     if (night > 0.2f && fmodf(rt * 1.5f, 1.0f) < 0.5f) addGlow(0, 1.2f, 0, 1.0f, 0.5f, 0.1f, 0.15f, night);
     glPopMatrix();
 }
+// seven-segment LED digit (local plane z = 0, x right, y up, (x,y) = bottom-left)
+static const unsigned char SEG7[10] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };
+static void ledQuad(float x0, float y0, float x1, float y1) {
+    glVertex3f(x0, y0, 0); glVertex3f(x1, y0, 0); glVertex3f(x1, y1, 0); glVertex3f(x0, y1, 0);
+}
+static void seg7(int dg, float x, float y, float w, float h, float r, float g, float b) {
+    float t = w * 0.17f, hh = h * 0.5f, gp = t * 0.25f;
+    unsigned char m = dg >= 0 && dg <= 9 ? SEG7[dg] : 0;
+    float S[7][4] = { {x + t + gp, y + h - t, x + w - t - gp, y + h}, {x + w - t, y + hh + gp, x + w, y + h - gp},
+                      {x + w - t, y + gp, x + w, y + hh - gp},       {x + t + gp, y, x + w - t - gp, y + t},
+                      {x, y + gp, x + t, y + hh - gp},               {x, y + hh + gp, x + t, y + h - gp},
+                      {x + t + gp, y + hh - t * 0.5f, x + w - t - gp, y + hh + t * 0.5f} };
+    glBegin(GL_QUADS);
+    for (int k = 0; k < 7; k++) {
+        if ((m >> k) & 1) glColor3f(r, g, b); else glColor3f(r * 0.09f + 0.02f, g * 0.09f + 0.02f, b * 0.09f + 0.02f);
+        ledQuad(S[k][0], S[k][1], S[k][2], S[k][3]);
+    }
+    glEnd();
+}
+static void boardFace() {
+    char buf[64];
+    struct T { static void st(const char* t, float w, float h, float r, float g, float b) { signText(t, w, h, r, g, b); glDisable(GL_LIGHTING); } };
+    glDisable(GL_LIGHTING);
+    glPushMatrix(); glTranslatef(0, 3.55f, 0); T::st("PEOPLE SHELTERED", 9.5f, 0.55f, 1.0f, 0.72f, 0.15f); glPopMatrix();
+    int n = std::min(999, sheltered);
+    int dg[3] = { n / 100, (n / 10) % 10, n % 10 };
+    for (int i = 0; i < 3; i++) seg7((i == 0 && n < 100) || (i == 1 && n < 10) ? -1 : dg[i], -5.2f + i * 1.45f, 1.15f, 1.15f, 1.9f, 0.25f, 1.0f, 0.35f);
+    glBegin(GL_QUADS);                                                        // "/"
+    glColor3f(1.0f, 0.72f, 0.15f);
+    glVertex3f(-0.55f, 1.15f, 0); glVertex3f(-0.3f, 1.15f, 0); glVertex3f(0.35f, 3.05f, 0); glVertex3f(0.1f, 3.05f, 0);
+    glEnd();
+    int cap[3] = { 7, 0, 0 };
+    for (int i = 0; i < 3; i++) seg7(cap[i], 0.8f + i * 0.95f, 1.15f, 0.75f, 1.25f, 1.0f, 0.72f, 0.15f);
+    glPushMatrix(); glTranslatef(4.75f, 2.75f, 0); T::st("CAP", 1.2f, 0.4f, 1.0f, 0.72f, 0.15f); glPopMatrix();
+    int pct = (int)(100.0f * n / 700.0f);
+    snprintf(buf, sizeof buf, "%d%% FULL", pct);
+    glPushMatrix(); glTranslatef(4.75f, 1.6f, 0); T::st(buf, 2.0f, 0.4f, 0.25f, 1.0f, 0.35f); glPopMatrix();
+    static const int sig[5] = { 0, 3, 7, 9, 10 };
+    int st = stageNo();
+    if (st > 0) snprintf(buf, sizeof buf, "WATER %.2f m   SIGNAL %d", waterLevel, sig[st]);
+    else snprintf(buf, sizeof buf, "WATER %.2f m   NORMAL", waterLevel);
+    glPushMatrix(); glTranslatef(0, 0.55f, 0);
+    if (st >= 2 && fmodf(rt, 1.0f) < 0.5f) T::st(buf, 10.0f, 0.5f, 1.0f, 0.2f, 0.12f); else T::st(buf, 10.0f, 0.5f, 1.0f, 0.55f, 0.15f);
+    glPopMatrix();
+    if (fmodf(rt, 1.0f) < 0.6f) { glColor3f(1.0f, 0.1f, 0.1f); glBegin(GL_QUADS); ledQuad(-5.6f, 3.45f, -5.3f, 3.75f); glEnd(); }   // "live" dot
+    glEnable(GL_LIGHTING);
+}
+static void drawShelterBoard() {
+    float roofY = shelterFloorY(4), by = roofY + 2.9f;
+    boxB(SHX - 5.2f, roofY, SHZ, 0.25f, 2.9f, 0.25f, 0.35f, 0.35f, 0.38f);       // posts
+    boxB(SHX + 5.2f, roofY, SHZ, 0.25f, 2.9f, 0.25f, 0.35f, 0.35f, 0.38f);
+    boxB(SHX, by, SHZ, 12.6f, 4.3f, 0.35f, 0.18f, 0.18f, 0.2f);                  // frame
+    glDisable(GL_LIGHTING);
+    glColor3f(0.02f, 0.02f, 0.03f);
+    for (int side = 0; side < 2; side++) {
+        glPushMatrix(); glTranslatef(SHX, by, SHZ); glRotatef(side * 180.0f, 0, 1, 0);
+        boxC(0, 2.15f, 0.12f, 12.1f, 3.9f, 0.14f);
+        glTranslatef(0, 0, 0.23f);
+        boardFace();
+        glDisable(GL_LIGHTING); glColor3f(0.02f, 0.02f, 0.03f);
+        glPopMatrix();
+    }
+    glEnable(GL_LIGHTING);
+    addGlow(SHX, by + 2.1f, SHZ + 0.4f, 0.3f, 1.0f, 0.4f, 1.6f, 0.15f + 0.35f * night);
+    addGlow(SHX, by + 2.1f, SHZ - 0.4f, 0.3f, 1.0f, 0.4f, 1.6f, 0.15f + 0.35f * night);
+}
 static void drawShelterDynamic() {
+    drawShelterBoard();
     float roofY = shelterFloorY(4);
     glPushMatrix(); glTranslatef(SHX, roofY + 1.2f, SHZ + 0.22f);
     signText("CYCLONE SHELTER", 11.5f, 1.3f, 1.0f, 1.0f, 1.0f);
@@ -2225,8 +2553,8 @@ static void drawRain() {
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
     float lum = mixf(0.78f, 0.35f, night) + flash * 0.5f;
-    float a = (viewMode == V_PERSON || viewMode == V_BOAT) ? 0.32f : 0.22f;
-    float sx = windX * windAmt * 9.0f * 0.05f, sz = windZ * windAmt * 9.0f * 0.05f, sy = 15.0f * 0.05f;
+    float a = (viewMode == V_PERSON || viewMode == V_BOAT) ? 0.38f : 0.26f;
+    float sx = windX * windAmt * 9.0f * 0.07f, sz = windZ * windAmt * 9.0f * 0.07f, sy = 15.0f * 0.07f;
     glBegin(GL_LINES);
     for (int i = 0; i < active; i++) {
         const Drop& d = drops[i];
@@ -2237,15 +2565,22 @@ static void drawRain() {
     glDepthMask(GL_TRUE); glDisable(GL_BLEND); glEnable(GL_LIGHTING);
 }
 static void drawBolt() {
-    if (boltLife <= 0 || boltN < 2) return;
+    if (boltLife <= 0 || boltN < 2 || flash < 0.5f) return;
     glDisable(GL_LIGHTING); glDisable(GL_FOG);
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
     for (int pass = 0; pass < 2; pass++) {
-        glLineWidth(pass ? 2.0f : 6.0f);
+        glLineWidth(pass ? 2.5f : 8.0f);
         glColor4f(0.75f, 0.82f, 1.0f, pass ? 0.95f : 0.3f);
         glBegin(GL_LINE_STRIP);
         for (int i = 0; i < boltN; i++) glVertex3f(boltP[i][0], boltP[i][1], boltP[i][2]);
         glEnd();
+        glLineWidth(pass ? 1.5f : 5.0f);
+        glColor4f(0.75f, 0.82f, 1.0f, pass ? 0.7f : 0.2f);
+        for (int b = 0; b < 2; b++) {
+            glBegin(GL_LINE_STRIP);
+            for (int i = 0; i < 8; i++) glVertex3f(boltB[b][i][0], boltB[b][i][1], boltB[b][i][2]);
+            glEnd();
+        }
     }
     glLineWidth(1.0f);
     glDisable(GL_BLEND); glEnable(GL_FOG); glEnable(GL_LIGHTING);
@@ -2461,6 +2796,17 @@ static void drawHUD() {
         rect2(winW * 0.5f - w * 0.5f - 12, winH - 78, w + 24, 30, 0.05f, 0.07f, 0.12f, 0.7f);
         glColor3f(1.0f, 0.8f, 0.45f);
         hudTextC(winW * 0.5f, winH - 57, buf, GLUT_BITMAP_HELVETICA_18);
+    }
+    if (annPlayT > 0 && annBoat >= 0) {
+        float d = len2(boats[annBoat].x - lisX, boats[annBoat].z - lisZ);
+        if (d < 150.0f) {
+            snprintf(buf, sizeof buf, "[Boat %d megaphone]  %s", annBoat + 1, ANN_TEXT);
+            float w = (float)glutBitmapLength(GLUT_BITMAP_HELVETICA_18, (const unsigned char*)buf);
+            float yy = winH - 118.0f;
+            rect2(winW * 0.5f - w * 0.5f - 12, yy - 21, w + 24, 30, 0.35f, 0.04f, 0.04f, 0.75f);
+            glColor3f(1.0f, 0.95f, 0.8f);
+            hudTextC(winW * 0.5f, yy, buf, GLUT_BITMAP_HELVETICA_18);
+        }
     }
     if (started && !running) {
         glColor3f(1, 0.85f, 0.3f);
@@ -2684,6 +3030,7 @@ static void idle() {
     weatherUpdate(dt);
     moveCamera(dt);
     if (running) for (int k = 0; k < speedMul; k++) update(dt);
+    updateAnnouncement(dt);
     computeAudioTargets();
     pumpAudio();
     glutPostRedisplay();
@@ -2836,6 +3183,7 @@ int main(int argc, char** argv) {
     buildScene();
     resetSim();
     setMsg("Press START (or ENTER) to begin the cyclone.  1-4 = views,  N = day / night.");
+    initAnnouncement();
     initAudio();
 
     glutDisplayFunc(display);
